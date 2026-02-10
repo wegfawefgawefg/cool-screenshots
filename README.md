@@ -4,6 +4,12 @@ A tiny X11 screenshot helper for i3.
 
 It provides fast keybind-friendly modes (region/window/fullscreen) plus an optional "macOS-ish card" effect (rounded screenshot + drop shadow on a colorful gradient background) and copies the result to the clipboard as PNG.
 
+## Example
+
+`Shift+Print` (`select-clip-effects`):
+
+![Example output](pic.png)
+
 ## Requirements
 
 Debian packages (recommended):
@@ -92,4 +98,3 @@ xev -event keyboard
 ```
 
 (This repo's i3 snippet uses keycode `107` specifically to avoid most of those issues.)
-
