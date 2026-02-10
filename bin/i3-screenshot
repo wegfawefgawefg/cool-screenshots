@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-save}"
+dir="${SCREENSHOT_DIR:-$HOME/Pictures/Screenshots}"
+ts="$(date +%F_%H-%M-%S)"
+out_default="$dir/$ts.png"
+
+mkdir -p "$dir"
+
+notify() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send "Screenshot" "$1"
+}
+
+die() {
+  notify "Error: $*"
+  echo "i3-screenshot: $*" >&2
+  exit 1
+}
+
+log() {
+  # Optional debug log: set SCREENSHOT_LOG=~/.cache/i3-screenshot.log
+  local msg="$1"
+  local logfile="${SCREENSHOT_LOG:-}"
+  [[ -n "$logfile" ]] || return 0
+  mkdir -p "$(dirname "$logfile")" 2>/dev/null || true
+  printf '%s %s\n' "$(date +%F_%H-%M-%S)" "$msg" >>"$logfile" 2>/dev/null || true
+}
+
+copy_png() {
+  local file="$1"
+  command -v xclip >/dev/null 2>&1 || die "xclip not found (install: apt install xclip)"
+  xclip -selection clipboard -t image/png -i "$file"
+}
+
+ensure_image_readable() {
+  local file="$1"
+  if [[ ! -s "$file" ]]; then
+    die "capture produced an empty file: $file"
+  fi
+  command -v identify >/dev/null 2>&1 || return 0
+  if ! identify "$file" >/dev/null 2>&1; then
+    die "capture output is not a readable image: $file"
+  fi
+}
+
+# Prefer xfce4-screenshooter when present: it supports active window capture (-w)
+# and uses a consistent pipeline in XFCE environments. Fall back to scrot.
+take_save() {
+  local kind="$1" # fullscreen|window|region
+  local out="${2:-$out_default}"
+
+  if command -v xfce4-screenshooter >/dev/null 2>&1; then
+    case "$kind" in
+      fullscreen) xfce4-screenshooter -f -s "$out" ;;
+      window) xfce4-screenshooter -w -s "$out" ;;
+      region) xfce4-screenshooter -r -s "$out" ;;
+      *) die "internal: unknown kind '$kind'" ;;
+    esac
+    ensure_image_readable "$out"
+    echo "$out"
+    return 0
+  fi
+
+  command -v scrot >/dev/null 2>&1 || die "scrot not found (install: apt install scrot)"
+  case "$kind" in
+    fullscreen) scrot "$out" ;;
+    window) scrot -u "$out" ;;
+    region) scrot -s "$out" ;;
+    *) die "internal: unknown kind '$kind'" ;;
+  esac
+  ensure_image_readable "$out"
+  echo "$out"
+}
+
+take_save_scrot() {
+  local kind="$1" # fullscreen|window|region
+  local out="$2"
+  command -v scrot >/dev/null 2>&1 || die "scrot not found (install: apt install scrot)"
+  case "$kind" in
+    fullscreen) scrot "$out" ;;
+    window) scrot -u "$out" ;;
+    region) scrot -s "$out" ;;
+    *) die "internal: unknown kind '$kind'" ;;
+  esac
+  ensure_image_readable "$out"
+  echo "$out"
+}
+
+take_clip() {
+  local kind="$1" # fullscreen|window|region
+
+  if command -v xfce4-screenshooter >/dev/null 2>&1; then
+    case "$kind" in
+      fullscreen) xfce4-screenshooter -f -c ;;
+      window) xfce4-screenshooter -w -c ;;
+      region) xfce4-screenshooter -r -c ;;
+      *) die "internal: unknown kind '$kind'" ;;
+    esac
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp --suffix=.png)"
+  trap 'rm -f "$tmp"' EXIT
+  take_save "$kind" "$tmp" >/dev/null
+  copy_png "$tmp"
+}
+
+stylize_png() {
+  local in="$1"
+  local out="$2"
+  local radius="${SCREENSHOT_RADIUS:-18}"
+  local shadow="${SCREENSHOT_SHADOW:-60x10+0+14}" # opacityxsigma+x+y (IM6 -shadow)
+  local shadow_rgba="${SCREENSHOT_SHADOW_RGBA:-rgba(0,0,0,0.35)}"
+  local pad="${SCREENSHOT_PAD:-24}"
+  local trim="${SCREENSHOT_TRIM:-2}"
+
+  command -v convert >/dev/null 2>&1 || die "ImageMagick 'convert' not found (install: apt install imagemagick)"
+
+  # Background gradient (approx "macOS screenshot" vibe)
+  local bg_a="${SCREENSHOT_BG_A:-#2b0a67}"
+  local bg_b="${SCREENSHOT_BG_B:-#b9d7ff}"
+  local bg_c="${SCREENSHOT_BG_C:-#e46cff}"
+  local bg_d="${SCREENSHOT_BG_D:-#4a2cff}"
+  local bg_pad_x="${SCREENSHOT_BG_PAD_X:-88}"
+  local bg_pad_y="${SCREENSHOT_BG_PAD_Y:-64}"
+  local mask_scale="${SCREENSHOT_MASK_SCALE:-6}"
+  local mask_blur="${SCREENSHOT_MASK_BLUR:-0.0}"
+  local mask_filter="${SCREENSHOT_MASK_FILTER:-Gaussian}"
+  local mask_filter_blur="${SCREENSHOT_MASK_FILTER_BLUR:-0.9}"
+
+  local src w h mask rounded padfile
+  src="$in"
+
+  w="$(identify -format '%w' "$src" 2>/dev/null)" || die "failed to read input image dimensions"
+  h="$(identify -format '%h' "$src" 2>/dev/null)" || die "failed to read input image dimensions"
+
+  # Some capture backends can accidentally include the selection outline ("marching ants")
+  # right at the crop edge. Shaving a couple pixels removes it without affecting content much.
+  if [[ "$trim" != "0" ]] && (( w > 2*trim )) && (( h > 2*trim )); then
+    src="$(mktemp --suffix=.png)"
+    if ! convert "$in" -shave "${trim}x${trim}" "$src" 2>/dev/null; then
+      log "stylize: trim failed, continuing without trim (trim=${trim})"
+      rm -f "$src" || true
+      src="$in"
+    fi
+  fi
+
+  w="$(identify -format '%w' "$src" 2>/dev/null)" || die "failed to read input image dimensions"
+  h="$(identify -format '%h' "$src" 2>/dev/null)" || die "failed to read input image dimensions"
+
+  mask="$(mktemp --suffix=.png)"
+  rounded="$(mktemp --suffix=.png)"
+  padfile="$(mktemp --suffix=.png)"
+  local shadowed bg1 bg2 bg bg_w bg_h
+  shadowed="$(mktemp --suffix=.png)"
+  bg1="$(mktemp --suffix=.png)"
+  bg2="$(mktemp --suffix=.png)"
+  bg="$(mktemp --suffix=.png)"
+
+  trap 'rm -f "$mask" "$rounded" "$padfile" "$shadowed" "$bg1" "$bg2" "$bg"' RETURN
+  [[ "$src" == "$in" ]] || trap 'rm -f "$src" "$mask" "$rounded" "$padfile" "$shadowed" "$bg1" "$bg2" "$bg"' RETURN
+
+  # Parse shadow spec so we can center the screenshot exactly, then offset only the shadow.
+  # Example: 60x10+0+14
+  local sh_op sh_sigma sh_x sh_y
+  if [[ "$shadow" =~ ^([0-9]+)x([0-9]+)([+-][0-9]+)([+-][0-9]+)$ ]]; then
+    sh_op="${BASH_REMATCH[1]}"
+    sh_sigma="${BASH_REMATCH[2]}"
+    sh_x="${BASH_REMATCH[3]}"
+    sh_y="${BASH_REMATCH[4]}"
+  else
+    die "invalid SCREENSHOT_SHADOW='$shadow' (expected e.g. 60x10+0+14)"
+  fi
+
+  log "stylize(card): in=$in out=$out w=$w h=$h radius=$radius shadow=${sh_op}x${sh_sigma}${sh_x}${sh_y} pad=$pad trim=$trim bg=[$bg_a,$bg_b,$bg_c,$bg_d] bg_pad=[$bg_pad_x,$bg_pad_y]"
+
+  # Rounded corners with a slightly anti-aliased edge:
+  # build the mask at higher resolution then downsample.
+  if ! [[ "$mask_scale" =~ ^[0-9]+$ ]] || (( mask_scale < 1 )); then
+    mask_scale=1
+  fi
+  if ! [[ "$mask_blur" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    mask_blur="0.0"
+  fi
+  local mw mh mr
+  mw=$(( w * mask_scale ))
+  mh=$(( h * mask_scale ))
+  mr=$(( radius * mask_scale ))
+  # Use a non-ringing downsample filter for alpha masks.
+  # Lanczos can introduce ringing artifacts (tiny transparent "holes") near sharp edges.
+  convert -size "${mw}x${mh}" xc:none -fill white \
+    -draw "roundrectangle 0,0 $((mw-1)),$((mh-1)),$mr,$mr" \
+    -filter "$mask_filter" -define "filter:blur=${mask_filter_blur}" \
+    -resize "${w}x${h}!" -blur "0x${mask_blur}" -colorspace gray -alpha off "$mask" \
+    || die "failed to generate rounded-corner mask"
+  convert "$src" "$mask" -alpha off -compose CopyOpacity -composite "$rounded" \
+    || die "failed to apply rounded corners"
+
+  # Add a bit of internal padding so the shadow doesn't clip and the card feels less cramped.
+  convert "$rounded" -bordercolor none -border "${pad}x${pad}" "$padfile" \
+    || die "failed to add padding"
+
+  # Build "screenshot + gray shadow" layer (no glow).
+  convert "$padfile" \
+    \( +clone -background "$shadow_rgba" -shadow "${sh_op}x${sh_sigma}+0+0" \) \
+    -delete 0 -background none -layers merge +repage "$shadowed" \
+    || die "failed to render drop shadow"
+
+  # Create a colorful background, then composite the shadowed screenshot centered.
+  bg_w=$(( w + 2*pad + bg_pad_x ))
+  bg_h=$(( h + 2*pad + bg_pad_y ))
+
+  convert -size "${bg_w}x${bg_h}" gradient:"$bg_a-$bg_b" "$bg1" \
+    || die "failed to render background gradient (1)"
+  convert -size "${bg_w}x${bg_h}" gradient:"$bg_c-$bg_d" -rotate 90 "$bg2" \
+    || die "failed to render background gradient (2)"
+  convert "$bg1" "$bg2" -compose screen -composite -blur 0x12 "$bg" \
+    || die "failed to combine background gradients"
+
+  # Composite in two steps so the screenshot content is truly centered:
+  # 1) shadow layer centered with an offset, 2) screenshot centered with no offset.
+  convert "$bg" "$shadowed" -gravity center -geometry "+${sh_x}${sh_y}" -compose over -composite "$bg" \
+    || die "failed to composite shadow on background"
+  convert "$bg" "$padfile" -gravity center -compose over -composite "$out" \
+    || die "failed to composite screenshot on background"
+}
+
+case "$mode" in
+  save)
+    out="$(take_save fullscreen "$out_default")"
+    notify "Saved to $out"
+    ;;
+  clip)
+    take_clip fullscreen
+    notify "Copied to clipboard"
+    ;;
+  select)
+    out="$(take_save region "$out_default")"
+    notify "Saved to $out"
+    ;;
+  select-clip)
+    take_clip region
+    notify "Selection copied to clipboard"
+    ;;
+  select-clip-effects)
+    in="$(mktemp --suffix=.png)"
+    out="$(mktemp --suffix=.png)"
+    trap 'rm -f "$in" "$out"' EXIT
+
+    log "mode=select-clip-effects starting"
+    # Prefer xfce4-screenshooter here for reliability; trim removes any selection outline.
+    take_save region "$in" >/dev/null || die "failed to capture region"
+    stylize_png "$in" "$out"
+    copy_png "$out"
+    notify "Selection copied to clipboard (effects)"
+    ;;
+  window)
+    out="$(take_save window "$out_default")"
+    notify "Saved to $out"
+    ;;
+  window-clip)
+    take_clip window
+    notify "Active window copied to clipboard"
+    ;;
+  *)
+    die "unknown mode '$mode' (expected: save|clip|select|select-clip|select-clip-effects|window|window-clip)"
+    ;;
+esac
